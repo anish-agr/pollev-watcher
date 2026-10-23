@@ -1,0 +1,136 @@
+name: Watch PollEv
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Watch for this many minutes, starting now"
+        default: "60"
+      user:
+        description: "PollEv username to watch (blank = the POLLEV_USER variable)"
+        default: ""
+      simulate:
+        description: "Test: seconds until fake polls start (blank for a real watch)"
+        default: ""
+      test_alerts:
+        description: "Test: send one alert to every channel and stop"
+        type: boolean
+        default: false
+      attempt:
+        description: "Leave at 0 (counts automatic restarts after a crash)"
+        default: "0"
+
+  # GitHub cron runs in UTC, and GitHub can start a scheduled run anywhere from a
+  # few minutes to hours late. So the schedule fires every 30 minutes from 10 hours
+  # to 35 minutes before class. The first run to land within 40 minutes of class
+  # waits for it, and the rest exit in under a minute. `python deploy.py` rewrites
+  # these lines from your .env. Without it, use the lines from
+  # `python watcher.py --print-cron` or from the summary of any manual run. The
+  # lines below are an example for a 1:30 PM Pacific class on weekdays. Scheduled
+  # runs do nothing until the CLASS_DAYS variable is set.
+  schedule:
+    - cron: "55 10,11,12,13,14,15,16,17,18,19,20 * * 1,2,3,4,5"
+    - cron: "25 11,12,13,14,15,16,17,18,19,20 * * 1,2,3,4,5"
+
+# Scheduled runs share a group so a pair of cron lines never overlaps.
+# Manual runs (tests, one-off watches) run alongside anything else.
+concurrency:
+  group: ${{ github.event_name == 'schedule' && 'pollev-schedule' || format('pollev-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write  # lets a crashed run start a replacement
+
+jobs:
+  watch:
+    if: github.event_name != 'schedule' || vars.CLASS_DAYS != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      POLLEV_USER: ${{ inputs.user || secrets.POLLEV_USER || vars.POLLEV_USER }}
+      TIMEZONE: ${{ vars.TIMEZONE }}
+      CLASS_DAYS: ${{ vars.CLASS_DAYS }}
+      CLASS_START: ${{ vars.CLASS_START }}
+      CLASS_END: ${{ vars.CLASS_END }}
+      SKIP_DATES: ${{ vars.SKIP_DATES }}
+      BROWSER_CHANNEL: ${{ vars.BROWSER_CHANNEL || 'chrome' }}  # the runner image already has Google Chrome
+      WATCH_END_FILE: watch-end.txt
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      NTFY_SERVER: ${{ vars.NTFY_SERVER }}
+      PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
+      ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      SMTP_HOST: ${{ vars.SMTP_HOST }}
+      SMTP_PORT: ${{ vars.SMTP_PORT }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Schedule hint
+        if: github.event_name == 'workflow_dispatch' && vars.CLASS_DAYS != '' && vars.CLASS_START != '' && vars.TIMEZONE != ''
+        run: |
+          {
+            echo "### Cron lines for your schedule"
+            echo "Paste these over the \`schedule:\` block in \`.github/workflows/watch.yml\`:"
+            echo '```yaml'
+            python watcher.py --print-cron
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Watch (manual)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          MINUTES: ${{ inputs.minutes }}
+          SIMULATE: ${{ inputs.simulate }}
+          TEST_ALERTS: ${{ inputs.test_alerts }}
+        run: |
+          args=(--minutes "$MINUTES")
+          [ -n "$SIMULATE" ] && args+=(--simulate "$SIMULATE")
+          [ "$TEST_ALERTS" = "true" ] && args+=(--test-alerts)
+          python watcher.py "${args[@]}"
+
+      - name: Watch (scheduled)
+        if: github.event_name == 'schedule'
+        run: python watcher.py
+
+      - name: Upload snapshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshots
+          path: snapshots/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # A crash in a real watch (not a test) starts a new run for the time that's
+      # left, up to 3 times in a row.
+      - name: Restart after a crash
+        id: restart
+        if: failure() && inputs.simulate == '' && inputs.test_alerts != true && hashFiles('watch-end.txt') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTEMPT: ${{ inputs.attempt || '0' }}
+          INPUT_USER: ${{ inputs.user }}
+        run: |
+          left=$(( ($(cat watch-end.txt) - $(date +%s)) / 60 ))
+          if [ "$ATTEMPT" -lt 3 ] && [ "$left" -ge 2 ]; then
+            args=(-f minutes="$left" -f attempt=$((ATTEMPT + 1)))
+            [ -n "$INPUT_USER" ] && args+=(-f user="$INPUT_USER")
+            gh workflow run watch.yml --ref "$GITHUB_REF_NAME" "${args[@]}"
+            echo "note=Started a replacement run for the last $left minutes." >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report failure
+        if: failure() && env.NTFY_TOPIC != ''
+        env:
+          NOTE: ${{ steps.restart.outputs.note }}
+        run: >
+          curl -s -H "Title: PollEv watcher crashed" -H "Priority: 4"
+          -d "Run failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} $NOTE"
+          "${NTFY_SERVER:-https://ntfy.sh}/$NTFY_TOPIC"
